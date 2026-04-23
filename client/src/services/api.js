@@ -5,4 +5,4 @@ const api = axios.create({
 });
 
 export const getBusinesses = () => api.get('/businesses');
-export const analyzeMarket = (data) => api.post('/analyze', data, { timeout: 60000 });
+export const analyzeMarket = (data) => api.post('/analyze', data, { timeout: 300000 });

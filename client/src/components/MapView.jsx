@@ -41,6 +41,15 @@ export default function MapView({ businesses = [], searchedLocation, isLoading, 
     ? [businesses[0].location.lat, businesses[0].location.lng]
     : [9.9300, 78.1400];
 
+  const handlePinClick = (business) => {
+    // If the scraped data has a website, go there. Otherwise, search Google Maps.
+    const locationString = typeof business.location === 'object' ? `${business.location.lat},${business.location.lng}` : business.location;
+    const targetUrl = business.website 
+      ? business.website 
+      : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(business.name + ' ' + (searchedLocation || locationString))}`;
+    window.open(targetUrl, '_blank', 'noopener,noreferrer');
+  };
+
   if (isLoading) {
     return (
       <div className="w-full h-full bg-slate-100 flex flex-col items-center justify-center p-6 text-center">
@@ -71,11 +80,16 @@ export default function MapView({ businesses = [], searchedLocation, isLoading, 
         
         {/* Render dynamic business markers */}
         {businesses.map((business, index) => (
-          <Marker key={business._id || index} position={[business.location.lat, business.location.lng]}>
+          <Marker 
+            key={business._id || index} 
+            position={[business.location.lat, business.location.lng]}
+            eventHandlers={{ click: () => handlePinClick(business) }}
+          >
             <Popup>
               <strong>{business.name}</strong><br/>
               Category: {business.category}<br/>
-              Rating: {business.rating}⭐
+              Rating: {business.rating}⭐<br/>
+              <span className="text-blue-600 text-xs mt-1 block cursor-pointer underline">Click map pin to view website/map</span>
             </Popup>
           </Marker>
         ))}

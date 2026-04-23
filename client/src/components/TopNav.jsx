@@ -22,10 +22,8 @@ export default function TopNav({ onSearch, isLoading }) {
 
   return (
     <nav className="flex items-center justify-between px-6 py-3 bg-white border-b border-slate-200 z-50 shadow-sm relative">
-      <div className="flex items-center gap-3">
-        <div className="flex items-center justify-center w-8 h-8 bg-blue-700 text-white shadow-sm">
-          <Compass size={20} />
-        </div>
+      <div className="flex items-center gap-2">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-8 h-8 text-blue-600"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
         <span className="font-semibold text-lg text-slate-900 tracking-tight">Market Opportunity Scout</span>
       </div>
       
