@@ -103,12 +103,6 @@ export default function TopNav({ onSearch, isLoading }) {
           Search
         </button>
       </form>
-
-      <div className="flex items-center">
-        <button className="px-5 py-2 bg-blue-700 hover:bg-blue-800 text-white text-sm font-medium transition-colors shadow-sm">
-          Export Report
-        </button>
-      </div>
     </nav>
   );
 }
