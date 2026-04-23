@@ -1,0 +1,28 @@
+{
+  "name": "business-gap-finder",
+  "version": "1.0.0",
+  "description": "1. Launch Google Antigravity on your Mac and open the **Agent Manager** (Mission Control). 2. Create a new workspace named `Market_Opportunity_Scout`. 3. Check the terminal execution settings. Set terminal execution to **Auto**. This ensures the agent can independently run `npm install` and scaffold the React/Node environments but will prompt you for permission before executing sensitive system-level commands.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "nodemon": "^3.1.11"
+  },
+  "dependencies": {
+    "@googlemaps/google-maps-services-js": "^3.4.2",
+    "axios": "^1.15.1",
+    "cheerio": "^1.0.0-rc.14",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "mongoose": "^9.0.0",
+    "puppeteer": "^24.42.0"
+  }
+}
