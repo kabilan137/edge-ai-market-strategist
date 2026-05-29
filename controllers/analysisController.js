@@ -28,7 +28,14 @@ exports.analyzeMarket = async (req, res) => {
     const normCategory = category ? category.trim().toLowerCase() : '';
     const normProduct = specificProduct ? specificProduct.trim().toLowerCase() : '';
 
-    // Check if we already have this analysis cached in the DB
+    // ─── Application-Level Cache Validation (TTL: 6 months) ─────────────────
+    // Uses Mongoose's auto-managed `updatedAt` field (via { timestamps: true })
+    // as the staleness clock. No schema changes required.
+    // Fresh  (<6 months) → return cached document immediately.
+    // Stale (>=6 months) → fall through to scraper + Gemini pipeline.
+    // ─────────────────────────────────────────────────────────────────────────
+    const CACHE_TTL_MS = 6 * 30 * 24 * 60 * 60 * 1000; // 6 months in milliseconds
+
     try {
       const existingAnalysis = await MarketAnalysis.findOne({
         searchMode: mode,
@@ -38,25 +45,36 @@ exports.analyzeMarket = async (req, res) => {
       });
 
       if (existingAnalysis) {
-        console.log(`Cache hit for ${mode}: ${normLocation} / ${normCategory} / ${normProduct}`);
-        
-        let cachedBusinesses = [];
-        if (mode === 'shop') {
-          cachedBusinesses = await Business.find({ category: normCategory, searchLocation: normLocation });
-        } else {
-          cachedBusinesses = [{ name: specificProduct, category: 'product', location: {lat:0, lng:0}, recentReviews: [] }];
+        const ageMs = Date.now() - new Date(existingAnalysis.updatedAt).getTime();
+        const isFresh = ageMs < CACHE_TTL_MS;
+
+        if (isFresh) {
+          console.log(`[Cache HIT - FRESH] ${mode}: ${normLocation} / ${normCategory || normProduct} (age: ${Math.floor(ageMs / 86400000)}d)`);
+
+          let cachedBusinesses = [];
+          if (mode === 'shop') {
+            cachedBusinesses = await Business.find({ category: normCategory, searchLocation: normLocation });
+          } else {
+            cachedBusinesses = [{ name: specificProduct, category: 'product', location: { lat: 0, lng: 0 }, recentReviews: [] }];
+          }
+
+          return res.status(200).json({
+            location,
+            category: mode === 'product' ? 'Product' : category,
+            businesses: cachedBusinesses,
+            analysis: existingAnalysis,
+            cached: true
+          });
         }
 
-        return res.status(200).json({
-          location,
-          category: mode === 'product' ? 'Product' : category,
-          businesses: cachedBusinesses,
-          analysis: existingAnalysis,
-          cached: true
-        });
+        // Record exists but is stale — fall through to live pipeline
+        console.log(`[Cache HIT - STALE] ${mode}: ${normLocation} / ${normCategory || normProduct} (age: ${Math.floor(ageMs / 86400000)}d). Re-running live pipeline...`);
+      } else {
+        console.log(`[Cache MISS] ${mode}: ${normLocation} / ${normCategory || normProduct}. Running live pipeline...`);
       }
     } catch (cacheErr) {
-      console.warn("Could not check cache:", cacheErr.message);
+      // DB read failure — degrade gracefully by running the live pipeline
+      console.warn('[Cache Check Failed] Falling back to live pipeline:', cacheErr.message);
     }
 
     // Universal Spatial Context
@@ -297,24 +315,38 @@ ${shopSpecificInstructions}
       return res.status(500).json({ error: 'Failed to parse AI recommendations.', rawResponse: responseText });
     }
 
-    // Save Analysis to Database
-    const newAnalysis = new MarketAnalysis({
+    // ─── Upsert Analysis to Database ─────────────────────────────────────────
+    // Uses findOneAndUpdate with upsert:true so that:
+    //   • A fresh document is inserted on a cache miss.
+    //   • A stale document is atomically overwritten on a cache stale-hit.
+    // Mongoose's { timestamps: true } automatically refreshes `updatedAt` on
+    // every successful write, resetting the 6-month TTL clock.
+    // ─────────────────────────────────────────────────────────────────────────
+    const analysisFilter = {
       searchMode: mode,
       searchLocation: normLocation,
       categorySearched: mode === 'product' ? 'Product' : normCategory,
       specificProduct: normProduct,
+    };
+
+    const analysisPayload = {
       opportunityScore: aiData.opportunityScore,
       confidenceScore: aiData.confidenceScore || 'Medium',
       aiRecommendation: aiData.aiRecommendation,
       strategyPlaybook: aiData.strategyPlaybook || [],
-      competitorMetrics: aiData.competitorMetrics || []
-    });
+      competitorMetrics: aiData.competitorMetrics || [],
+    };
 
     try {
-      await newAnalysis.save();
+      await MarketAnalysis.findOneAndUpdate(
+        analysisFilter,
+        { $set: analysisPayload },
+        { upsert: true, new: true, runValidators: true }
+      );
+      console.log(`[DB] Analysis upserted for ${mode}: ${normLocation}`);
     } catch (dbError) {
-      console.error('Database Save Error:', dbError.message);
-      // Even if DB save fails, we can still return the analysis to frontend for the MVP
+      console.error('[DB Upsert Error]', dbError.message);
+      // Non-fatal: return analysis to frontend even if persistence fails
     }
 
     // Step D: Return clean JSON to frontend
