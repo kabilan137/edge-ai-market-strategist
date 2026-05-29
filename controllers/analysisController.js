@@ -1,4 +1,5 @@
 const axios = require('axios');
+const { GoogleGenAI } = require('@google/genai');
 const MarketAnalysis = require('../models/MarketAnalysis');
 const Business = require('../models/Business');
 const { getLocalBusinesses } = require('../utils/locationScraper');
@@ -223,21 +224,38 @@ ${shopSpecificInstructions}
       }
     }
 
+    // ─── Gemini Cloud Inference ───────────────────────────────────────────────
+    // Replaces: Ollama local fetch (llama3 @ localhost:11434)
+    // Engine  : gemini-2.5-flash via @google/genai SDK
+    // Contract: responseText is identical downstream — all parsing logic below
+    //           is left completely untouched.
+    // ─────────────────────────────────────────────────────────────────────────
     let responseText;
     try {
-      const ollamaResponse = await axios.post('http://localhost:11434/api/generate', {
-        model: "llama3",
-        prompt: promptText,
-        format: "json",
-        stream: false,
-        options: { temperature: 0.1 }
+      const client = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+      const geminiResponse = await client.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: promptText,
+        config: {
+          temperature: 0.1,
+          responseMimeType: 'application/json', // Native JSON mode — prevents markdown filler
+        },
       });
-      responseText = ollamaResponse.data.response;
-    } catch (ollamaErr) {
-      if (ollamaErr.code === 'ECONNREFUSED') {
-        return res.status(503).json({ error: "Local Edge AI Engine is offline. Please ensure the Ollama server is running in the background." });
-      }
-      throw ollamaErr;
+
+      responseText = geminiResponse.text;
+    } catch (geminiErr) {
+      console.error('[Gemini API Error]', geminiErr.message);
+
+      // Graceful fallback: return a zero-confidence sentinel so the app never crashes.
+      // Downstream parsing still works; the UI will show a degraded state.
+      responseText = JSON.stringify({
+        opportunityScore: 0,
+        aiRecommendation: 'AI inference is temporarily unavailable. Please try again shortly.',
+        strategyPlaybook: [],
+        confidenceScore: '0',
+        competitorMetrics: [],
+      });
     }
     
     // Parse the AI response
