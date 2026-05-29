@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { Search, MapPin, Compass, ChevronDown, Loader2, Tag, ShoppingBag, Store } from 'lucide-react';
+import { Search, MapPin, Loader2, Tag, ShoppingBag, Store } from 'lucide-react';
+import CategoryCombobox from './CategoryCombobox';
 
 export default function TopNav({ onSearch, isLoading }) {
   const [searchMode, setSearchMode] = useState('shop'); // 'shop' or 'product'
@@ -61,22 +62,12 @@ export default function TopNav({ onSearch, isLoading }) {
         </div>
 
         {searchMode === 'shop' && (
-          <div className="relative flex flex-1 items-center border border-slate-300 bg-white hover:border-slate-400 transition-colors">
-            <select 
-              value={searchCategory}
-              onChange={(e) => setSearchCategory(e.target.value)}
-              className="w-full pl-3 pr-8 py-2 bg-transparent text-sm outline-none text-slate-900 appearance-none cursor-pointer"
-            >
-              <option value="">Category</option>
-              <option value="cafe">Cafe & Coffee Shops</option>
-              <option value="pharmacy">Pharmacies</option>
-              <option value="repair">Auto Repair</option>
-              <option value="gym">Fitness Centers</option>
-            </select>
-            <div className="absolute right-3 pointer-events-none text-slate-500">
-              <ChevronDown size={16} />
-            </div>
-          </div>
+          <CategoryCombobox
+            value={searchCategory}
+            onChange={setSearchCategory}
+            placeholder="Category (type or choose…)"
+            disabled={!!isLoading}
+          />
         )}
 
         <div className="flex flex-1 items-center border border-slate-300 bg-slate-50 focus-within:border-blue-600 focus-within:ring-1 focus-within:ring-blue-600 transition-all">
