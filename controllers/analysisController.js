@@ -1,4 +1,5 @@
 const axios = require('axios');
+const { GoogleGenAI } = require('@google/genai');
 const MarketAnalysis = require('../models/MarketAnalysis');
 const Business = require('../models/Business');
 const { getLocalBusinesses } = require('../utils/locationScraper');
@@ -6,6 +7,21 @@ const { scrapeReviews } = require('../utils/reviewScraper');
 const { scrapeProductReviews } = require('../utils/productScraper');
 const { fetchClimate } = require('../utils/fetchClimate');
 const { fetchDensity } = require('../utils/fetchDensity');
+
+// ─── ARCHITECTURAL MANDATE ────────────────────────────────────────────────────
+// Gemini is a DATA ANALYZER — never a DATA GENERATOR.
+//
+// Overpass OSM nodes are the single source of truth for competitor existence.
+// If Overpass returns 0 nodes:
+//   → The pipeline short-circuits BEFORE calling Gemini.
+//   → A deterministic Greenfield sentinel (confidence_score: 0.1) is returned.
+//   → No LLM call is made; no data is invented.
+//
+// If Overpass returns ≥1 node:
+//   → Gemini receives ONLY the real node names and review snippets.
+//   → Gemini is FORBIDDEN from adding competitor names not in the input list.
+//   → competitorMetrics keys MUST match the provided node names exactly.
+// ─────────────────────────────────────────────────────────────────────────────
 
 exports.analyzeMarket = async (req, res) => {
   try {
@@ -25,9 +41,11 @@ exports.analyzeMarket = async (req, res) => {
 
     const normLocation = location ? location.trim().toLowerCase() : '';
     const normCategory = category ? category.trim().toLowerCase() : '';
-    const normProduct = specificProduct ? specificProduct.trim().toLowerCase() : '';
+    const normProduct  = specificProduct ? specificProduct.trim().toLowerCase() : '';
 
-    // Check if we already have this analysis cached in the DB
+    // ─── Application-Level Cache Validation (TTL: 6 months) ──────────────────
+    const CACHE_TTL_MS = 6 * 30 * 24 * 60 * 60 * 1000;
+
     try {
       const existingAnalysis = await MarketAnalysis.findOne({
         searchMode: mode,
@@ -37,37 +55,46 @@ exports.analyzeMarket = async (req, res) => {
       });
 
       if (existingAnalysis) {
-        console.log(`Cache hit for ${mode}: ${normLocation} / ${normCategory} / ${normProduct}`);
-        
-        let cachedBusinesses = [];
-        if (mode === 'shop') {
-          cachedBusinesses = await Business.find({ category: normCategory, searchLocation: normLocation });
-        } else {
-          cachedBusinesses = [{ name: specificProduct, category: 'product', location: {lat:0, lng:0}, recentReviews: [] }];
+        const ageMs = Date.now() - new Date(existingAnalysis.updatedAt).getTime();
+        const isFresh = ageMs < CACHE_TTL_MS;
+
+        if (isFresh) {
+          console.log(`[Cache HIT - FRESH] ${mode}: ${normLocation} / ${normCategory || normProduct} (age: ${Math.floor(ageMs / 86400000)}d)`);
+
+          let cachedBusinesses = [];
+          if (mode === 'shop') {
+            cachedBusinesses = await Business.find({ category: normCategory, searchLocation: normLocation });
+          } else {
+            cachedBusinesses = [{ name: specificProduct, category: 'product', location: { lat: 0, lng: 0 }, recentReviews: [] }];
+          }
+
+          return res.status(200).json({
+            location,
+            category: mode === 'product' ? 'Product' : category,
+            businesses: cachedBusinesses,
+            analysis: existingAnalysis,
+            cached: true
+          });
         }
 
-        return res.status(200).json({
-          location,
-          category: mode === 'product' ? 'Product' : category,
-          businesses: cachedBusinesses,
-          analysis: existingAnalysis,
-          cached: true
-        });
+        console.log(`[Cache HIT - STALE] ${mode}: ${normLocation} / ${normCategory || normProduct} (age: ${Math.floor(ageMs / 86400000)}d). Re-running live pipeline...`);
+      } else {
+        console.log(`[Cache MISS] ${mode}: ${normLocation} / ${normCategory || normProduct}. Running live pipeline...`);
       }
     } catch (cacheErr) {
-      console.warn("Could not check cache:", cacheErr.message);
+      console.warn('[Cache Check Failed] Falling back to live pipeline:', cacheErr.message);
     }
 
-    // Universal Spatial Context
-    let contextStr = "Unknown";
+    // ─── Universal Spatial Context ────────────────────────────────────────────
+    let contextStr = 'Unknown';
     try {
       if (normLocation) {
-        const nomResponse = await axios.get(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(normLocation)}&limit=1`, {
-          headers: { 'User-Agent': 'MarketOpportunityScout/1.0' }
-        });
+        const nomResponse = await axios.get(
+          `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(normLocation)}&limit=1`,
+          { headers: { 'User-Agent': 'MarketOpportunityScout/1.0' } }
+        );
         if (nomResponse.data && nomResponse.data.length > 0) {
-          const lat = nomResponse.data[0].lat;
-          const lng = nomResponse.data[0].lon;
+          const { lat, lon: lng } = nomResponse.data[0];
           const [climateResult, densityResult] = await Promise.all([
             fetchClimate(lat, lng),
             fetchDensity(lat, lng)
@@ -76,13 +103,14 @@ exports.analyzeMarket = async (req, res) => {
         }
       }
     } catch (ctxErr) {
-      console.warn("Universal Spatial context failed:", ctxErr.message);
+      console.warn('Universal Spatial context failed:', ctxErr.message);
     }
 
+    // ═════════════════════════════════════════════════════════════════════════
+    // SHOP MODE
+    // ═════════════════════════════════════════════════════════════════════════
     if (mode === 'shop') {
-      const normLocation = location.trim().toLowerCase();
-      const normCategory = category.trim().toLowerCase();
-
+      // 1. Read from DB cache first
       try {
         businesses = await Business.find({ category: normCategory, searchLocation: normLocation });
       } catch (dbErr) {
@@ -90,96 +118,164 @@ exports.analyzeMarket = async (req, res) => {
         return res.status(500).json({ error: 'Database connection or timeout error.' });
       }
 
+      // 2. On-demand Overpass scrape if DB has nothing
       if (businesses.length === 0) {
-        console.log(`No real-time data found for ${normCategory} in ${normLocation}. Initiating on-demand scraping...`);
+        console.log(`No cached data for ${normCategory} in ${normLocation}. Querying Overpass API...`);
         try {
           const scrapedBusinesses = await getLocalBusinesses(normLocation, normCategory);
-          
+
           if (scrapedBusinesses.length > 0) {
             const topBusinesses = scrapedBusinesses.slice(0, 8);
-            
+
             for (const biz of topBusinesses) {
               try {
                 const reviews = await scrapeReviews(biz.name, normLocation);
                 biz.recentReviews = reviews;
               } catch (scrapeErr) {
-                console.error(`Skipping ${biz.name} due to scrape error:`, scrapeErr.message);
+                console.error(`Skipping review scrape for ${biz.name}:`, scrapeErr.message);
                 biz.recentReviews = [];
               }
             }
-            
+
             await Business.insertMany(topBusinesses);
             businesses = await Business.find({ category: normCategory, searchLocation: normLocation });
           }
         } catch (onDemandErr) {
-          console.error('On-demand scraping error:', onDemandErr);
-          // Do not fail, just let businesses remain empty
+          console.error('On-demand Overpass scraping error:', onDemandErr);
         }
       }
 
-      let dataVolume = 0;
-
+      // ─── DETERMINISTIC GREENFIELD BRANCH ───────────────────────────────────
+      // Overpass returned zero nodes → market is Greenfield by definition.
+      // Skip Gemini entirely. Return a structured Low-Confidence sentinel.
+      // This is NOT an LLM decision — it is a hard data-integrity check.
+      // ───────────────────────────────────────────────────────────────────────
       if (businesses.length === 0) {
-        realReviewsData = "Zero existing competitors found in this exact geographic boundary.";
-      } else {
-        dataVolume = businesses.reduce((acc, b) => acc + (b.recentReviews ? b.recentReviews.length : 0), 0);
-        realReviewsData = businesses.map(b => {
-          const reviewText = b.recentReviews && b.recentReviews.length > 0 
-            ? b.recentReviews.map(r => "- " + r).join('\n') 
-            : "- No reviews found.";
-          return `Business: ${b.name}\nReviews:\n${reviewText}`;
-        }).join('\n\n');
+        console.log(`[Greenfield] Zero Overpass nodes for ${normCategory} in ${normLocation}. Returning deterministic Greenfield response.`);
+
+        const greenfieldPayload = {
+          marketState:      'greenfield',
+          opportunityScore: 92,          // high — no incumbents means clear runway
+          confidenceScore:  'Low',
+          aiRecommendation: `No live ${normCategory} assets were detected in the Overpass OSM registry for ${location}. This market has zero verified incumbent nodes, signalling a first-mover opportunity — but the Low Confidence score reflects the absence of raw data to corroborate this signal. Conduct a physical site survey before committing capital.`,
+          strategyPlaybook: [
+            `Perform a physical site survey of ${location} before signing any lease — OSM coverage may be incomplete.`,
+            `Register your business on Google Maps and OpenStreetMap immediately to claim first-mover digital presence.`,
+            `Install high-visibility signage and invest in exterior lighting to capitalise on zero incumbent foot-traffic competition.`
+          ],
+          competitorMetrics: [],   // authoritative empty array — Overpass found nothing
+          competitor_count:  0,
+        };
+
+        // Persist the Greenfield sentinel to DB so future cache hits return it
+        const analysisFilter = {
+          searchMode:       mode,
+          searchLocation:   normLocation,
+          categorySearched: normCategory,
+          specificProduct:  normProduct,
+        };
+        try {
+          await MarketAnalysis.findOneAndUpdate(
+            analysisFilter,
+            { $set: greenfieldPayload },
+            { upsert: true, returnDocument: 'after', runValidators: true }
+          );
+          console.log(`[DB] Greenfield sentinel upserted for ${normLocation}/${normCategory}`);
+        } catch (dbError) {
+          console.error('[DB Upsert Error - Greenfield]', dbError.message);
+        }
+
+        return res.status(200).json({
+          location,
+          category,
+          businesses: [],
+          analysis:   greenfieldPayload
+        });
       }
 
-      const systemConfidence = dataVolume >= 10 ? 'High' : (dataVolume >= 4 ? 'Medium' : 'Low');
-      const finalContextStr = `${contextStr} | Sanitized Review Count: ${dataVolume} | System Confidence: ${systemConfidence}`;
-      const localShopNames = businesses && businesses.length > 0 ? businesses.map(b => b.name).join(', ') : 'None found';
+      // ─── COMPETITIVE BRANCH: ≥1 Overpass node exists ──────────────────────
+      // Build review context from real scraped data only.
+      const dataVolume = businesses.reduce((acc, b) => acc + (b.recentReviews?.length || 0), 0);
+      realReviewsData = businesses.map(b => {
+        const reviewText = b.recentReviews && b.recentReviews.length > 0
+          ? b.recentReviews.map(r => `- ${r}`).join('\n')
+          : '- No reviews found.';
+        return `Business: ${b.name}\nReviews:\n${reviewText}`;
+      }).join('\n\n');
 
-      let shopSpecificInstructions = "";
-      const isLowDensity = contextStr.toLowerCase().includes('density: low') || contextStr.toLowerCase().includes('density: zero');
+      const systemConfidence = dataVolume >= 10 ? 'High' : dataVolume >= 4 ? 'Medium' : 'Low';
+      const finalContextStr  = `${contextStr} | Overpass Node Count: ${businesses.length} | Scraped Review Count: ${dataVolume} | System Confidence: ${systemConfidence}`;
 
+      // The ONLY competitor names Gemini is allowed to use
+      const verifiedNodeNames = businesses.map(b => b.name).join(', ');
+
+      const isLowDensity = contextStr.toLowerCase().includes('density: low') ||
+                           contextStr.toLowerCase().includes('density: zero');
+
+      let shopInstructions = '';
       if (isLowDensity) {
-          shopSpecificInstructions = `
+        shopInstructions = `
      "opportunityScore": (Number 1-15. Do NOT exceed 15),
-     "aiRecommendation": "FATAL GEOGRAPHIC FLAW: Do not open a retail shop here. The population density is too low to support physical foot traffic.",
-     "strategyPlaybook": ["Cancel lease negotiations immediately.", "Pivot search to a high-density urban center.", "Re-evaluate physical retail strategy."],
-          `;
+     "aiRecommendation": "FATAL GEOGRAPHIC FLAW: Population density is too low to support physical retail foot traffic at this location.",
+     "strategyPlaybook": ["Cancel lease negotiations immediately.", "Pivot to a high-density urban centre.", "Re-evaluate physical retail strategy."],`;
       } else {
-          shopSpecificInstructions = `
-     "opportunityScore": (Number 50-100 based on competitor weakness),
-     "aiRecommendation": (String. Write a 2-sentence market analysis focusing on how to beat the competitors in this specific location. Do NOT mention low foot traffic.),
-     "strategyPlaybook": [(Array of 3 Strings. MUST be specific operational/physical tactics like 'Implement valet parking' or 'Upgrade HVAC'. BANNED PHRASES: 'Conduct market research', 'target audience'.)],
-          `;
+        shopInstructions = `
+     "opportunityScore": (Number 50-100 based on the weakness signals found in the review data),
+     "aiRecommendation": (String. Write a 2-sentence market analysis on how to outcompete the listed businesses based ONLY on the review evidence provided. Do NOT invent claims not supported by the review data.),
+     "strategyPlaybook": [(Array of 3 Strings. MUST be specific operational tactics like 'Install valet parking' or 'Upgrade HVAC'. BANNED: 'Conduct market research', 'target audience'.)],`;
       }
 
       promptText = `
-   Act as a ruthless Market Strategist.
-   Location: ${location}
-   Context: ${finalContextStr}
-   Map Businesses: ${localShopNames}
-   Review Data: ${realReviewsData}
-   
-   Return ONLY valid JSON matching this exact schema with no markdown:
-   {
-${shopSpecificInstructions}
-     "confidenceScore": "${systemConfidence}",
-     "competitorMetrics": [(Array of Objects). If 'Review Data' is missing real complaints or contains SEO spam, YOU MUST populate this array using the names from 'Map Businesses'. Assign each name a sentimentScore of 50 and mainWeakness of 'No digital reviews available'.]
-   }
+You are a Market Strategist. Your role is to ANALYZE the provided data — never to generate or invent data.
+
+Location: ${location}
+Context: ${finalContextStr}
+
+VERIFIED COMPETITOR LIST (from Overpass OSM — these are the ONLY businesses that exist in this market):
+${verifiedNodeNames}
+
+SCRAPED REVIEW DATA (raw text from public sources):
+${realReviewsData}
+
+STRICT ANALYSIS RULES:
+1. You MUST populate "competitorMetrics" using ONLY the business names listed in the VERIFIED COMPETITOR LIST above.
+2. You are STRICTLY FORBIDDEN from adding any competitor name that does not appear in the VERIFIED COMPETITOR LIST.
+3. If a business has no review data, set sentimentScore to 50 (neutral — no data) and mainWeakness to "No public reviews detected".
+4. You MUST NOT guess, hallucinate, or infer competitor names from your training knowledge.
+
+Return ONLY valid JSON with no markdown:
+{
+${shopInstructions}
+  "confidenceScore": "${systemConfidence}",
+  "marketState": "competitive",
+  "competitorMetrics": [
+    {
+      "name": "(String — MUST be one of: ${verifiedNodeNames})",
+      "sentimentScore": (Number 1-100. Derived from the review text above. Use 50 if no reviews.),
+      "mainWeakness": "(String. Extracted from the review text above. Use 'No public reviews detected' if none.)"
+    }
+  ]
+  CRITICAL SCHEMA RULE: Keys MUST be exactly "name", "sentimentScore", "mainWeakness". sentimentScore MUST be a Number, never a String.
+}
       `;
-      console.log("FINAL LLM PROMPT:\n", promptText);
+      console.log('FINAL LLM PROMPT:\n', promptText);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // PRODUCT MODE
+    // ═══════════════════════════════════════════════════════════════════════
     } else if (mode === 'product') {
       try {
-        console.log(`Initiating product scraping for ${specificProduct}...`);
+        console.log(`Initiating product review scrape for ${specificProduct}...`);
         const productReviews = await scrapeProductReviews(specificProduct);
-        
-        let dataVolume = productReviews.length;
-        if (productReviews.length === 0) {
-          realReviewsData = "Scraper blocked, no data retrieved";
+
+        const dataVolume = productReviews.length;
+        if (dataVolume === 0) {
+          realReviewsData = 'Scraper blocked or no reviews retrieved — data volume is zero.';
         } else {
-          realReviewsData = productReviews.map(r => "- " + r).join('\n');
+          realReviewsData = productReviews.map(r => `- ${r}`).join('\n');
         }
-        
-        // Mock a business array so frontend MapView doesn't crash completely (or it can just render empty)
+
+        // product mode has no Overpass nodes — a single synthetic entry tracks the search target
         businesses = [{
           name: specificProduct,
           category: 'product',
@@ -187,84 +283,142 @@ ${shopSpecificInstructions}
           recentReviews: productReviews
         }];
 
-        const systemConfidence = dataVolume >= 10 ? 'High' : (dataVolume >= 4 ? 'Medium' : 'Low');
-        const finalContextStr = `${contextStr} | Sanitized Review Count: ${dataVolume} | System Confidence: ${systemConfidence}`;
+        const systemConfidence = dataVolume >= 10 ? 'High' : dataVolume >= 4 ? 'Medium' : 'Low';
+        const finalContextStr  = `${contextStr} | Scraped Review Count: ${dataVolume} | System Confidence: ${systemConfidence}`;
 
-        promptText = `Act as a ruthless Hardware Engineering Architect.
-   Target Market: ${location}
-   Context: ${finalContextStr}
-   Global Reviews: ${realReviewsData}
+        // For product mode: Gemini may name brands ONLY if they appear in the scraped review text.
+        // If the scraper returned nothing, competitorMetrics MUST be an empty array.
+        const brandExtractionRule = dataVolume === 0
+          ? 'The scraper returned zero reviews. You MUST return competitorMetrics as an empty array [].'
+          : 'Extract brand names ONLY from the text in "Scraped Global Reviews". Do NOT add brands from your training knowledge.';
 
-   Return ONLY valid JSON matching this exact schema with no markdown. 
-   {
-     "opportunityScore": (Number 1-100),
-     "aiRecommendation": "String. You MUST write exactly 2 sentences. You MUST explicitly mention how the Climate and Temperature from the Context makes this product physically necessary or vulnerable.",
-     "strategyPlaybook": [
-       "String 1: State a specific physical hardware or manufacturing modification (e.g., 'Upgrade thermal paste to survive 40C heat').",
-       "String 2: State a specific physical hardware or manufacturing modification.",
-       "String 3: State a specific physical hardware or manufacturing modification."
-     ],
-     "confidenceScore": (String). OVERRIDE RULE: If 'Global Reviews' contains Affiliate Blogs or SEO lists (e.g., 'Top 10 best generators') instead of real angry customer complaints, you MUST output 'Low'. Otherwise output '${systemConfidence}'.
-     "competitorMetrics": [
-       { 
-         "name": "Exact Brand Name (e.g., EcoFlow or Anker)", 
-         "sentimentScore": (Number 1-100 based on review sentiment), 
-         "mainWeakness": "Specific hardware flaw extracted from reviews (String)" 
-       }
-     ]
-   }
-   
-   CRITICAL HARDWARE RULE: You are strictly FORBIDDEN from suggesting marketing, partnerships, logistics, or research. The 'strategyPlaybook' MUST ONLY contain physical engineering and manufacturing upgrades.
-   CRITICAL SCHEMA RULE: You MUST use the exact keys "name", "sentimentScore", and "mainWeakness" for the competitor objects. Do NOT use "brand", "flaws", or nested arrays.`;
-        console.log("FINAL LLM PROMPT:\n", promptText); 
+        promptText = `
+You are a Hardware Engineering Architect. Your role is to ANALYZE the provided review data — never to invent or generate data.
+
+Target Market: ${location}
+Product Category: ${specificProduct}
+Context: ${finalContextStr}
+Scraped Global Reviews:
+${realReviewsData}
+
+STRICT ANALYSIS RULES:
+${brandExtractionRule}
+
+Return ONLY valid JSON with no markdown:
+{
+  "opportunityScore": (Number 1-100),
+  "aiRecommendation": "String. Exactly 2 sentences. MUST mention the Climate/Temperature context and how it affects this product category.",
+  "strategyPlaybook": [
+    "String 1: A specific physical hardware or manufacturing modification.",
+    "String 2: A specific physical hardware or manufacturing modification.",
+    "String 3: A specific physical hardware or manufacturing modification."
+  ],
+  "confidenceScore": "${systemConfidence}",
+  "marketState": "competitive",
+  "competitorMetrics": [
+    {
+      "name": "(Brand name extracted from Scraped Global Reviews text ONLY — never from training knowledge)",
+      "sentimentScore": (Number 1-100 based on review sentiment for this brand),
+      "mainWeakness": "(Hardware flaw extracted from review text for this brand)"
+    }
+  ]
+}
+
+CRITICAL HARDWARE RULE: strategyPlaybook MUST contain ONLY physical engineering / manufacturing changes. Marketing, partnerships, and research are FORBIDDEN.
+CRITICAL SCHEMA RULE: Keys must be exactly "name", "sentimentScore", "mainWeakness". sentimentScore MUST be a Number.
+        `;
+        console.log('FINAL LLM PROMPT:\n', promptText);
       } catch (productErr) {
         console.error('Product scraping error:', productErr);
         return res.status(500).json({ error: 'Failed to scrape product data. Please try again.' });
       }
     }
 
+    // ─── Gemini Cloud Inference ───────────────────────────────────────────────
+    // Gemini is called ONLY when Overpass returned ≥1 node (shop) or the product
+    // scraper ran. It receives real data and is forbidden from inventing any.
+    // ─────────────────────────────────────────────────────────────────────────
     let responseText;
     try {
-      const ollamaResponse = await axios.post('http://localhost:11434/api/generate', {
-        model: "llama3",
-        prompt: promptText,
-        format: "json",
-        stream: false,
-        options: { temperature: 0.1 }
+      const client = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+      const geminiResponse = await client.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: promptText,
+        config: {
+          temperature: 0.1,
+          responseMimeType: 'application/json',
+        },
       });
-      responseText = ollamaResponse.data.response;
-    } catch (ollamaErr) {
-      if (ollamaErr.code === 'ECONNREFUSED') {
-        return res.status(503).json({ error: "Local Edge AI Engine is offline. Please ensure the Ollama server is running in the background." });
-      }
-      throw ollamaErr;
+
+      responseText = geminiResponse.text;
+    } catch (geminiErr) {
+      console.error('[Gemini API Error]', geminiErr.message);
+      responseText = JSON.stringify({
+        opportunityScore:  0,
+        aiRecommendation:  'AI inference is temporarily unavailable. Please try again shortly.',
+        strategyPlaybook:  [],
+        confidenceScore:   'Low',
+        marketState:       'competitive',
+        competitorMetrics: [],
+      });
     }
-    
-    // Parse the AI response
+
+    // ─── Parse & Sanitize Gemini Response ────────────────────────────────────
     let aiData;
     try {
-      // Clean potential markdown or backticks to ensure valid JSON
       let cleanJson = responseText.replace(/```json/gi, '').replace(/```/g, '').trim();
-      
-      // Extract only the JSON object between the first { and last }
       const startIdx = cleanJson.indexOf('{');
-      const endIdx = cleanJson.lastIndexOf('}');
+      const endIdx   = cleanJson.lastIndexOf('}');
       if (startIdx !== -1 && endIdx !== -1) {
         cleanJson = cleanJson.substring(startIdx, endIdx + 1);
       }
-      
       aiData = JSON.parse(cleanJson);
-      
-      // Sanitize strategyPlaybook to ensure Mongoose schema compliance (Array of Strings)
+
+      // ── Sanitize competitorMetrics ──────────────────────────────────────────
+      // Additional integrity check: in shop mode, strip any competitor that is NOT
+      // in the verified Overpass node list (guards against Gemini ignoring the rule).
+      const verifiedSet = new Set(
+        mode === 'shop' ? businesses.map(b => b.name.toLowerCase()) : []
+      );
+
+      if (Array.isArray(aiData.competitorMetrics)) {
+        aiData.competitorMetrics = aiData.competitorMetrics
+          .map(item => {
+            if (!item || typeof item !== 'object') return null;
+
+            const name =
+              item.name ?? item.business ?? item.brand ?? item.competitor ?? null;
+
+            // INTEGRITY GATE: In shop mode, reject any name not in the Overpass list.
+            if (mode === 'shop' && name && !verifiedSet.has(String(name).toLowerCase())) {
+              console.warn(`[Integrity] Gemini injected unknown competitor "${name}" — stripped.`);
+              return null;
+            }
+
+            const rawScore = item.sentimentScore ?? item.sentiment_score ?? item.score ?? item.rating ?? 50;
+            const sentimentScore = Math.min(100, Math.max(1, Number(rawScore) || 50));
+
+            const mainWeakness =
+              item.mainWeakness ?? item.main_weakness ?? item.weakness ?? item.flaw ?? 'No public reviews detected';
+
+            return {
+              name:         String(name || 'Unknown'),
+              sentimentScore,
+              mainWeakness: String(mainWeakness),
+            };
+          })
+          .filter(Boolean);
+      } else {
+        aiData.competitorMetrics = [];
+      }
+
+      // ── Sanitize strategyPlaybook ───────────────────────────────────────────
       if (Array.isArray(aiData.strategyPlaybook)) {
         aiData.strategyPlaybook = aiData.strategyPlaybook.map(item => {
           if (typeof item === 'string') return item;
           if (typeof item === 'object' && item !== null) {
-            // Extract text if AI incorrectly returned objects (e.g. {"Step 1": "..."} or {"Step 1...": ""})
-            return Object.entries(item).map(([k, v]) => {
-              if (v === "" || v === null) return k;
-              return `${k}: ${v}`;
-            }).join(' | ');
+            return Object.entries(item).map(([k, v]) => (v === '' || v === null ? k : `${k}: ${v}`)).join(' | ');
           }
           return String(item);
         });
@@ -273,38 +427,48 @@ ${shopSpecificInstructions}
       } else {
         aiData.strategyPlaybook = [];
       }
-      
+
+      // Ensure marketState is set
+      aiData.marketState = aiData.marketState || 'competitive';
+
     } catch (parseError) {
-      console.error('Failed to parse AI response:', responseText);
+      console.error('Failed to parse Gemini response:', responseText);
       return res.status(500).json({ error: 'Failed to parse AI recommendations.', rawResponse: responseText });
     }
 
-    // Save Analysis to Database
-    const newAnalysis = new MarketAnalysis({
-      searchMode: mode,
-      searchLocation: normLocation,
+    // ─── Upsert to Database ───────────────────────────────────────────────────
+    const analysisFilter = {
+      searchMode:       mode,
+      searchLocation:   normLocation,
       categorySearched: mode === 'product' ? 'Product' : normCategory,
-      specificProduct: normProduct,
-      opportunityScore: aiData.opportunityScore,
-      confidenceScore: aiData.confidenceScore || 'Medium',
-      aiRecommendation: aiData.aiRecommendation,
-      strategyPlaybook: aiData.strategyPlaybook || [],
-      competitorMetrics: aiData.competitorMetrics || []
-    });
+      specificProduct:  normProduct,
+    };
+
+    const analysisPayload = {
+      marketState:       aiData.marketState,
+      opportunityScore:  aiData.opportunityScore,
+      confidenceScore:   aiData.confidenceScore || 'Low',
+      aiRecommendation:  aiData.aiRecommendation,
+      strategyPlaybook:  aiData.strategyPlaybook || [],
+      competitorMetrics: aiData.competitorMetrics || [],
+    };
 
     try {
-      await newAnalysis.save();
+      await MarketAnalysis.findOneAndUpdate(
+        analysisFilter,
+        { $set: analysisPayload },
+        { upsert: true, returnDocument: 'after', runValidators: true }
+      );
+      console.log(`[DB] Analysis upserted for ${mode}: ${normLocation}`);
     } catch (dbError) {
-      console.error('Database Save Error:', dbError.message);
-      // Even if DB save fails, we can still return the analysis to frontend for the MVP
+      console.error('[DB Upsert Error]', dbError.message);
     }
 
-    // Step D: Return clean JSON to frontend
     res.status(200).json({
       location,
-      category: mode === 'product' ? 'Product' : category,
+      category:   mode === 'product' ? 'Product' : category,
       businesses,
-      analysis: aiData
+      analysis:   aiData
     });
 
   } catch (error) {
