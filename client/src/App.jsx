@@ -14,11 +14,11 @@ function App() {
   const intervalRef = useRef(null);
 
   const loadingMessages = [
-    "Initializing Edge Compute Engine...",
-    "Scraping Global Market Sentiment...",
+    "Initializing Compute Engine...",
+    "Querying Overpass API for live OSM data...",
     "Sanitizing Data & Removing Bot Noise...",
     "Evaluating Spatial Context (Weather & Density)...",
-    "Llama 3 Compiling Strategic Playbook..."
+    "Gemini 2.5 Flash Compiling Strategic Playbook..."
   ];
 
   useEffect(() => {
@@ -54,9 +54,9 @@ function App() {
 
       setError(null);
       setSearchedLocation(location || 'Global');
-      console.log('Sending payload:', { searchMode, location, category, specificProduct });
       const response = await analyzeMarket({ searchMode, location, category, specificProduct });
-      console.log('Received response:', response.data);
+      // businesses array contains Overpass nodes with verified lat/lng — passed
+      // directly to MapView for pin rendering, never touched by the LLM pipeline.
       setBusinesses(response.data.businesses || []);
       setAnalysis(response.data.analysis);
     } catch (err) {
@@ -73,10 +73,18 @@ function App() {
       <TopNav onSearch={handleAnalyze} isLoading={!!isLoading} />
       <main className="flex-1 flex w-full overflow-hidden">
         <div className="w-[60%] h-full relative z-0">
-          <MapView businesses={businesses} searchedLocation={searchedLocation} isLoading={isLoading} error={error} />
+          {/* MapView receives ONLY Overpass-sourced businesses (verified coordinates).
+              The analysis object is intentionally NOT passed here — the map must
+              never render AI-generated or geocoded pins. */}
+          <MapView
+            businesses={businesses}
+            searchedLocation={searchedLocation}
+            isLoading={isLoading}
+            error={error}
+          />
         </div>
         <div className="w-[40%] h-full z-10 shadow-[-4px_0_15px_rgba(0,0,0,0.03)]">
-          <InsightsPanel analysis={analysis} />
+          <InsightsPanel analysis={analysis} businesses={businesses} />
         </div>
       </main>
     </div>
