@@ -10,7 +10,7 @@ export default defineConfig({
     allowedHosts: true, // This line allows the ngrok connection
     proxy: {
       '/api': {
-        target: 'http://localhost:5001',
+        target: 'https://business-gap-finder.onrender.com',
         changeOrigin: true,
         secure: false
       },
