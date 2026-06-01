@@ -19,8 +19,22 @@ const AMENITY_MAP = {
   'school':         'school',
   'college':        'college',
   'university':     'university',
-  'hotel':          'hotel',
   'laundry':        'laundry',
+};
+
+// ─── Tier 2b: Tourism values ──────────────────────────────────────────────────
+// OSM tourism=* tag covers accommodation and attractions.
+const TOURISM_MAP = {
+  'hotel':           'hotel',
+  'hostel':          'hostel',
+  'motel':           'motel',
+  'guest house':     'guest_house',
+  'guesthouse':      'guest_house',
+  'bed and breakfast':'bed_and_breakfast',
+  'b&b':             'bed_and_breakfast',
+  'resort':          'resort',
+  'museum':          'museum',
+  'zoo':             'zoo',
 };
 
 // ─── Tier 2: Known shop values ────────────────────────────────────────────────
@@ -52,6 +66,37 @@ const SHOP_MAP = {
 };
 
 // ─── Tier 3 handled inline via regex ──────────────────────────────────────────
+
+// ─── Cuisine map (food-type searches → amenity=restaurant + cuisine filter) ───
+// OSM uses amenity=restaurant with a cuisine=* sub-tag, NOT a separate amenity.
+const CUISINE_MAP = {
+  'pizza':           'pizza',
+  'pizza place':     'pizza',
+  'sushi':           'sushi',
+  'sushi restaurant':'sushi',
+  'burger':          'burger',
+  'burger joint':    'burger',
+  'chinese':         'chinese',
+  'chinese restaurant':'chinese',
+  'indian':          'indian',
+  'indian restaurant':'indian',
+  'italian':         'italian',
+  'italian restaurant':'italian',
+  'mexican':         'mexican',
+  'thai':            'thai',
+  'japanese':        'japanese',
+  'korean':          'korean',
+  'vegan':           'vegan',
+  'vegetarian':      'vegetarian',
+  'seafood':         'seafood',
+  'steak':           'steak_house',
+  'steakhouse':      'steak_house',
+  'bbq':             'bbq',
+  'barbecue':        'bbq',
+  'sandwich':        'sandwich',
+  'noodle':          'noodles',
+  'noodles':         'noodles',
+};
 
 // ─── Leisure map (small set, handled separately) ──────────────────────────────
 const LEISURE_MAP = {
@@ -100,6 +145,9 @@ function resolveOsmTag(category) {
   if (AMENITY_MAP[lower])  return { key: 'amenity',  value: AMENITY_MAP[lower] };
   if (SHOP_MAP[lower])     return { key: 'shop',     value: SHOP_MAP[lower] };
   if (LEISURE_MAP[lower])  return { key: 'leisure',  value: LEISURE_MAP[lower] };
+  if (TOURISM_MAP[lower])  return { key: 'tourism',  value: TOURISM_MAP[lower] };
+  // Cuisine lookups return a special shape — amenity=restaurant filtered by cuisine
+  if (CUISINE_MAP[lower])  return { key: 'amenity',  value: 'restaurant', cuisine: CUISINE_MAP[lower] };
 
   // Partial-match pass (handles "auto repair shop" → car_repair, etc.)
   for (const [term, val] of Object.entries(AMENITY_MAP)) {
@@ -110,6 +158,12 @@ function resolveOsmTag(category) {
   }
   for (const [term, val] of Object.entries(LEISURE_MAP)) {
     if (lower.includes(term)) return { key: 'leisure', value: val };
+  }
+  for (const [term, val] of Object.entries(TOURISM_MAP)) {
+    if (lower.includes(term)) return { key: 'tourism', value: val };
+  }
+  for (const [term, val] of Object.entries(CUISINE_MAP)) {
+    if (lower.includes(term)) return { key: 'amenity', value: 'restaurant', cuisine: val };
   }
 
   return null; // Tier 3: unknown — use regex fallback
@@ -132,8 +186,22 @@ function buildOverpassQuery(sanitizedCategory, searchArea) {
   const tag = resolveOsmTag(sanitizedCategory);
 
   if (tag) {
-    // ── Exact-match query (Tier 1 / 2 / leisure) ─────────────────────────
-    const { key, value } = tag;
+    const { key, value, cuisine } = tag;
+
+    if (cuisine) {
+      // ── Cuisine-filtered query (e.g. pizza → amenity=restaurant + cuisine~pizza) ─
+      return `
+        [out:json][timeout:25];
+        (
+          node["${key}"="${value}"]["cuisine"~"${cuisine}",i](${searchArea});
+          way["${key}"="${value}"]["cuisine"~"${cuisine}",i](${searchArea});
+          relation["${key}"="${value}"]["cuisine"~"${cuisine}",i](${searchArea});
+        );
+        out center 20;
+      `;
+    }
+
+    // ── Exact-match query (Tier 1 / 2 / leisure / tourism) ────────────────────
     return `
       [out:json][timeout:25];
       (
@@ -146,9 +214,9 @@ function buildOverpassQuery(sanitizedCategory, searchArea) {
   }
 
   // ── Regex fallback query (Tier 3 — custom / unrecognised input) ───────────
-  // Uses Overpass regex syntax (~"pattern",i) to search both shop and amenity
-  // keys case-insensitively, so no user input ever causes a silent miss or
-  // a malformed query.
+  // Uses Overpass regex syntax (~"pattern",i) to search shop, amenity, leisure
+  // and tourism keys case-insensitively, so no user input ever causes a silent
+  // miss or a malformed query.
   const pattern = sanitizedCategory.replace(/\s+/g, '_'); // e.g. "wine shop" → "wine_shop"
   return `
     [out:json][timeout:25];
@@ -159,6 +227,10 @@ function buildOverpassQuery(sanitizedCategory, searchArea) {
       node["amenity"~"${pattern}",i](${searchArea});
       way["amenity"~"${pattern}",i](${searchArea});
       relation["amenity"~"${pattern}",i](${searchArea});
+      node["leisure"~"${pattern}",i](${searchArea});
+      way["leisure"~"${pattern}",i](${searchArea});
+      node["tourism"~"${pattern}",i](${searchArea});
+      way["tourism"~"${pattern}",i](${searchArea});
     );
     out center 20;
   `;
@@ -194,7 +266,7 @@ async function getLocalBusinesses(location, category) {
     console.log(`[Overpass] Querying for "${safeCategory}" near ${location}...`);
 
     // 4. Execute the Overpass query
-    const overpassUrl = 'http://overpass-api.de/api/interpreter';
+    const overpassUrl = 'https://overpass-api.de/api/interpreter';
     const response = await axios.post(
       overpassUrl,
       `data=${encodeURIComponent(query)}`,
@@ -211,19 +283,29 @@ async function getLocalBusinesses(location, category) {
     console.log(`[Overpass] ${elements.length} raw elements returned.`);
 
     // 5. Map OSM elements to the Business schema shape
+    //    Keep ALL elements that have valid coordinates — even unnamed ones.
+    //    (The previous filter discarded every node without a `name` tag, which
+    //     silently eliminated the majority of OSM results in many regions.)
     const businesses = elements
       .map((el) => {
-        const elLat = el.lat || (el.center && el.center.lat);
-        const elLon = el.lon || (el.center && el.center.lon);
+        const elLat = el.lat    ?? (el.center && el.center.lat);
+        const elLon = el.lon    ?? (el.center && el.center.lon);
+        // Build a human-readable fallback name from available OSM tags
+        const fallbackName =
+          (el.tags && (el.tags['brand'] || el.tags['operator'] || el.tags['ref']))
+            ? (el.tags['brand'] || el.tags['operator'] || el.tags['ref'])
+            : `Unnamed ${category}`;
         return {
-          name: el.tags && el.tags.name ? el.tags.name : `Unnamed ${category}`,
-          category: category,
+          name:           el.tags && el.tags.name ? el.tags.name : fallbackName,
+          category:       category,
           searchLocation: location.toLowerCase(),
-          location: { lat: elLat, lng: elLon },
+          location:       { lat: elLat, lng: elLon },
         };
       })
-      .filter((b) => b.location.lat && b.name !== `Unnamed ${category}`);
+      // Only discard elements that have NO usable coordinates
+      .filter((b) => b.location.lat != null && b.location.lng != null);
 
+    console.log(`[Overpass] ${businesses.length} businesses after coordinate filter.`);
     return businesses;
   } catch (error) {
     console.error('[Overpass] Error fetching businesses:', error.message);
