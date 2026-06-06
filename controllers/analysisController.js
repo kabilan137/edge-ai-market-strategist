@@ -265,8 +265,8 @@ ${shopInstructions}
     // ═══════════════════════════════════════════════════════════════════════
     } else if (mode === 'product') {
       try {
-        console.log(`Initiating product review scrape for ${specificProduct}...`);
-        const productReviews = await scrapeProductReviews(specificProduct);
+        console.log(`Initiating localized product review scrape for "${specificProduct}" in "${location}"...`);
+        const productReviews = await scrapeProductReviews(specificProduct, location);
 
         const dataVolume = productReviews.length;
         if (dataVolume === 0) {
@@ -290,42 +290,74 @@ ${shopInstructions}
         // If the scraper returned nothing, competitorMetrics MUST be an empty array.
         const brandExtractionRule = dataVolume === 0
           ? 'The scraper returned zero reviews. You MUST return competitorMetrics as an empty array [].'
-          : 'Extract brand names ONLY from the text in "Scraped Global Reviews". Do NOT add brands from your training knowledge.';
+          : 'Extract brand names ONLY from the text inside <localized_scraped_reviews>. Do NOT add brands from your training knowledge.';
 
         promptText = `
-You are a Hardware Engineering Architect. Your role is to ANALYZE the provided review data — never to invent or generate data.
+<system_role>
+You are a Hardware Engineering Architect at Antigravity — a location-intelligence firm.
+Your SOLE mandate is to ANALYZE the structured data provided below and return a precise,
+engineering-grade market assessment. You MUST NOT invent, hallucinate, or supplement
+the provided data with information from your training knowledge.
+</system_role>
 
-Target Market: ${location}
-Product Category: ${specificProduct}
-Context: ${finalContextStr}
-Scraped Global Reviews:
+<context>
+  <target_location>${location}</target_location>
+  <product_category>${specificProduct}</product_category>
+  <pipeline_context>${finalContextStr}</pipeline_context>
+  <localized_scraped_reviews source="DuckDuckGo — localized query for '${location} ${specificProduct}'">
 ${realReviewsData}
+  </localized_scraped_reviews>
+</context>
 
-STRICT ANALYSIS RULES:
-${brandExtractionRule}
+<rules>
+  <rule id="LOCAL_COMPETITOR_ISOLATION" priority="CRITICAL">
+    You are operating on LOCALIZED review data scraped specifically for the "${location}" market.
+    You MUST extract competitor/brand names ONLY from the text inside <localized_scraped_reviews>.
+    You are STRICTLY FORBIDDEN from injecting brand names from your training knowledge — even
+    well-known global brands (e.g. Bosch, Philips, LG) MUST NOT appear unless their name is
+    explicitly present in the scraped text above.
+    ${brandExtractionRule}
+  </rule>
+  <rule id="CLIMATE_CONDITIONALITY" priority="CRITICAL">
+    Evaluate whether climate, temperature, or weather MATERIALLY impacts the physical hardware
+    of "${specificProduct}" (e.g. corrosion from humidity, thermal expansion, UV degradation,
+    outdoor waterproofing requirements, condensation on electronics).
+    — IF climate materially impacts this hardware: include one focused sentence on the specific
+      environmental engineering implication for the "${location}" climate in aiRecommendation.
+    — IF climate is irrelevant to this hardware category: OMIT all weather/temperature/climate
+      references entirely from aiRecommendation. Do not force-fit an environmental angle.
+  </rule>
+  <rule id="HARDWARE_ONLY_STRATEGY" priority="CRITICAL">
+    strategyPlaybook MUST contain ONLY physical engineering or manufacturing modifications.
+    FORBIDDEN entries: marketing campaigns, partnerships, market research, audience targeting,
+    pricing strategies, distribution channels, or any non-physical recommendation.
+  </rule>
+  <rule id="SCHEMA_INTEGRITY" priority="CRITICAL">
+    JSON keys must be EXACTLY as specified. sentimentScore MUST be a Number, never a String.
+  </rule>
+</rules>
 
-Return ONLY valid JSON with no markdown:
+<output_schema>
+Return ONLY valid JSON. No markdown fences. No commentary before or after the JSON block.
 {
-  "opportunityScore": (Number 1-100),
-  "aiRecommendation": "String. Exactly 2 sentences. MUST mention the Climate/Temperature context and how it affects this product category.",
+  "opportunityScore": (Number 1-100, reflecting the engineering gap opportunity in ${location} based on review pain points),
+  "aiRecommendation": "String. Exactly 2 sentences. Follow the CLIMATE_CONDITIONALITY rule above.",
   "strategyPlaybook": [
-    "String 1: A specific physical hardware or manufacturing modification.",
-    "String 2: A specific physical hardware or manufacturing modification.",
-    "String 3: A specific physical hardware or manufacturing modification."
+    "String 1: A specific physical hardware or manufacturing modification for the ${location} market.",
+    "String 2: A specific physical hardware or manufacturing modification for the ${location} market.",
+    "String 3: A specific physical hardware or manufacturing modification for the ${location} market."
   ],
   "confidenceScore": "${systemConfidence}",
   "marketState": "competitive",
   "competitorMetrics": [
     {
-      "name": "(Brand name extracted from Scraped Global Reviews text ONLY — never from training knowledge)",
-      "sentimentScore": (Number 1-100 based on review sentiment for this brand),
-      "mainWeakness": "(Hardware flaw extracted from review text for this brand)"
+      "name": "(Brand name extracted EXCLUSIVELY from <localized_scraped_reviews> text — never from training knowledge)",
+      "sentimentScore": (Number 1-100 derived from review sentiment for this brand. Use 50 if no review data.),
+      "mainWeakness": "(Specific hardware flaw extracted from review text for this brand. Use 'No public reviews detected' if none.)"
     }
   ]
 }
-
-CRITICAL HARDWARE RULE: strategyPlaybook MUST contain ONLY physical engineering / manufacturing changes. Marketing, partnerships, and research are FORBIDDEN.
-CRITICAL SCHEMA RULE: Keys must be exactly "name", "sentimentScore", "mainWeakness". sentimentScore MUST be a Number.
+</output_schema>
         `;
         console.log('FINAL LLM PROMPT:\n', promptText);
       } catch (productErr) {

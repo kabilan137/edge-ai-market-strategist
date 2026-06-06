@@ -238,6 +238,37 @@ function buildOverpassQuery(sanitizedCategory, searchArea) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * retryPost
+ *
+ * Wraps an axios.post call with simple exponential-backoff retry logic.
+ * Retries only on network errors or 5xx responses (transient server failures).
+ *
+ * @param {string} url        - Target URL.
+ * @param {string} data       - POST body.
+ * @param {object} config     - Axios request config.
+ * @param {number} maxRetries - How many times to retry (default 3).
+ * @returns {Promise<object>} Axios response.
+ */
+async function retryPost(url, data, config, maxRetries = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await axios.post(url, data, config);
+    } catch (err) {
+      lastError = err;
+      const status = err.response?.status;
+      // Only retry on transient server errors (5xx) or network timeouts
+      const isRetryable = !status || (status >= 500 && status <= 599);
+      if (!isRetryable || attempt === maxRetries) throw err;
+      const delay = 1000 * Math.pow(2, attempt - 1); // 1s, 2s, 4s …
+      console.warn(`[Overpass] Attempt ${attempt} failed (${status ?? 'network error'}). Retrying in ${delay / 1000}s…`);
+      await new Promise((res) => setTimeout(res, delay));
+    }
+  }
+  throw lastError;
+}
+
 async function getLocalBusinesses(location, category) {
   try {
     // 1. Geocode location via Nominatim
@@ -265,9 +296,9 @@ async function getLocalBusinesses(location, category) {
     const query = buildOverpassQuery(safeCategory, searchArea);
     console.log(`[Overpass] Querying for "${safeCategory}" near ${location}...`);
 
-    // 4. Execute the Overpass query
+    // 4. Execute the Overpass query (with retry on 5xx / timeout)
     const overpassUrl = 'https://overpass-api.de/api/interpreter';
-    const response = await axios.post(
+    const response = await retryPost(
       overpassUrl,
       `data=${encodeURIComponent(query)}`,
       {
@@ -276,6 +307,7 @@ async function getLocalBusinesses(location, category) {
           'Accept': 'application/json',
           'Content-Type': 'application/x-www-form-urlencoded',
         },
+        timeout: 30000, // 30 s hard cap — prevents hanging indefinitely
       }
     );
 
